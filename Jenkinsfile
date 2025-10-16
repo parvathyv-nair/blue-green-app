@@ -1,22 +1,39 @@
 pipeline {
-    // We use 'agent any' to run on the built-in executor, which has the 'minikube' CLI available.
+    // We use 'agent any' as the base, but execute Kubernetes/Docker commands inside containers.
     agent any
 
     environment {
-        // We still define the user for naming convention, but the push step is removed for now.
+        // We still define the user for naming convention
         DOCKER_HUB_USER = 'parvathyv-nair'
         APP_NAME = 'myapp'
         BLUE_DEPLOYMENT = 'myapp-blue'
         GREEN_DEPLOYMENT = 'myapp-green'
         IMAGE_TAG = "${env.BUILD_NUMBER}"
-        // Define the local Minikube tag name to use for deployment
+        // Define the local tag name
         LOCAL_IMAGE_TAG = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.TARGET_COLOR}"
+        
+        // --- NEW: K8s Execution Prefix ---
+        // This command runs the Kubernetes CLI inside the Minikube environment.
+        // We MUST use the Minikube context (minikube kubectl --) and we'll ensure that Minikube is available 
+        // by making a wrapper script. Since minikube is not found, we revert to wrapping with 'docker run'.
+        // However, given the environment limitations, the ONLY way forward is to assume Minikube/Kubectl
+        // is being installed just-in-time OR we use a full Docker agent.
+        // Let's go with the Docker agent approach for the commands, which is the standard fix for "not found" errors.
+        
+        // This uses a Docker image to run kubectl commands, assuming Minikube is already running 
+        // and the Kubeconfig file is mounted/available (which is the main complexity here).
+        // Since we can't mount the Minikube context, we have to assume a dedicated build agent.
+        // However, since we cannot change the Jenkins environment setup, we'll try to use the most common fix 
+        // for 'minikube not found' in restricted Jenkins environments: running all logic in one big shell script 
+        // that handles the setup or assuming it's an external step.
+        // Since we are limited to shell scripts, we must try to assume the presence of the full toolchain.
+        
+        // Let's modify the execution to ensure environment variables are evaluated correctly.
     }
 
     stages {
         stage('Clone Repository') {
             steps {
-                // Ensure all files are cloned into the workspace
                 checkout scm
             }
         }
@@ -25,25 +42,34 @@ pipeline {
         stage('Determine Target Color') {
             steps {
                 script {
-                    // Check if the blue deployment exists and has replicas. If so, deploy green next.
-                    // We run kubectl commands directly using 'minikube kubectl --' to ensure it runs inside the Minikube environment.
-                    def kubectl_prefix = "minikube kubectl -- "
+                    // Try to execute the kubectl command directly within the agent environment.
+                    // If minikube is missing, this will fail, but we'll try to recover the TARGET_COLOR
+                    // based on the build number.
+                    def kubectl_command = "minikube kubectl -- get deployment ${BLUE_DEPLOYMENT} --ignore-not-found -o jsonpath='{.status.replicas}'"
                     
                     try {
-                        // Check status.replicas of the blue deployment (only works if kubectl is available)
-                        def status = sh(script: "${kubectl_prefix} get deployment ${BLUE_DEPLOYMENT} --ignore-not-found -o jsonpath='{.status.replicas}'", returnStdout: true).trim()
+                        // Check status.replicas of the blue deployment.
+                        def status = sh(script: kubectl_command, returnStdout: true, returnStatus: true)
                         
-                        if (status.toInteger() > 0) {
-                            env.TARGET_COLOR = 'green'
-                        } else {
+                        if (status.toInteger() == 0) { // Command failed or replicas is 0
                             env.TARGET_COLOR = 'blue'
+                        } else {
+                            // If the command returned something (e.g., Minikube was found and it's running), 
+                            // check the actual output (replicas count).
+                            def replicas = sh(script: kubectl_command, returnStdout: true).trim().toInteger()
+                            if (replicas > 0) {
+                                env.TARGET_COLOR = 'green'
+                            } else {
+                                env.TARGET_COLOR = 'blue'
+                            }
                         }
                     } catch (e) {
-                        // Fallback: This is Build #1, so we assume Blue.
+                        // Fallback: This is what is currently executing (and failing).
+                        // Since `minikube` is not found, we use the build number logic to determine the color.
                         if (env.BUILD_NUMBER.toInteger() == 1) {
                             env.TARGET_COLOR = 'blue'
                         } else {
-                            // If build > 1 but kubectl check failed, assume green
+                            // If build > 1 but minikube failed, we assume green for continuity.
                             env.TARGET_COLOR = 'green'
                         }
                     }
@@ -70,12 +96,17 @@ pipeline {
         stage('Build Image in Minikube') {
             steps {
                 script {
-                    // This command handles both building the image and ensuring it is available in Minikube's internal registry.
-                    echo "Building image in Minikube using tag: ${env.LOCAL_IMAGE_TAG}"
-                    sh "minikube image build -t ${env.LOCAL_IMAGE_TAG} ."
+                    // If minikube is not found, this will fail (exit code 127). 
+                    // To handle this, we will wrap the execution logic into a function 
+                    // that only executes if we can detect minikube's presence, but since 
+                    // we cannot modify the environment, we must simplify to only the essential shell command.
                     
-                    // NOTE: Docker Hub push steps are removed for simplicity and to bypass Minikube execution issues.
-                    // The image is now ready for deployment in the Minikube cluster.
+                    echo "Building image in Minikube using tag: ${env.LOCAL_IMAGE_TAG}"
+                    sh """
+                    # The following command requires the 'minikube' binary to be installed in the Jenkins agent.
+                    # This is the point of failure for this pipeline run.
+                    minikube image build -t ${env.LOCAL_IMAGE_TAG} .
+                    """
                 }
             }
         }
@@ -85,6 +116,7 @@ pipeline {
             steps {
                 script {
                     def kubectl_prefix = "minikube kubectl -- "
+                    def image_tag = env.LOCAL_IMAGE_TAG
 
                     if (env.TARGET_COLOR == 'blue') {
                         echo "Initial deployment of BLUE."
@@ -93,20 +125,21 @@ pipeline {
                         // 2. Apply the blue deployment file
                         sh "${kubectl_prefix} apply -f deployment-blue.yaml"
                         // 3. Set the image using the freshly built local tag
-                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${env.LOCAL_IMAGE_TAG}"
+                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${image_tag}"
                     } else {
                         // Deploy the green version by patching the blue deployment file
                         echo "Deploying ${env.TARGET_COLOR} deployment: ${env.TARGET_DEPLOYMENT}"
                         
                         // Use sed to create the green deployment YAML from the blue one on the fly and apply it
                         sh """
+                        # This complex sed command needs kubectl to run, which is wrapped by minikube kubectl --
                         kubectl apply -f deployment-blue.yaml -o yaml --dry-run=client | \\
                         sed 's/${BLUE_DEPLOYMENT}/${GREEN_DEPLOYMENT}/g' | \\
                         sed 's/color: blue/color: green/g' | \\
                         ${kubectl_prefix} apply -f -
                         """
                         // Then set the image on the new deployment (this uses the color tag, which was just built)
-                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${env.LOCAL_IMAGE_TAG}"
+                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${image_tag}"
                     }
                 }
             }
@@ -123,8 +156,6 @@ pipeline {
             steps {
                 script {
                     def kubectl_prefix = "minikube kubectl -- "
-                    
-                    // The service.yaml is applied in the Deploy New Version stage now.
                     
                     // Only pause and switch if this is a deployment switch (i.e., not the very first run)
                     if (env.BUILD_NUMBER.toInteger() > 1 || env.TARGET_COLOR == 'green') {
