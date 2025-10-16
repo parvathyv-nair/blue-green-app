@@ -1,8 +1,6 @@
 pipeline {
     // The main node will run the cleanup/setup commands, but the core stages use dedicated agents.
-    agent {
-        label 'master' // Use the main Jenkins Pod for the initial steps
-    }
+    agent any // Changed from 'master' to 'any' to run on the default executor
 
     environment {
         // Replace with your Docker Hub username
