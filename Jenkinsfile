@@ -3,12 +3,14 @@ pipeline {
     agent any
 
     environment {
-        // Replace with your Docker Hub username
+        // We still define the user for naming convention, but the push step is removed for now.
         DOCKER_HUB_USER = 'parvathyv-nair'
         APP_NAME = 'myapp'
         BLUE_DEPLOYMENT = 'myapp-blue'
         GREEN_DEPLOYMENT = 'myapp-green'
         IMAGE_TAG = "${env.BUILD_NUMBER}"
+        // Define the local Minikube tag name to use for deployment
+        LOCAL_IMAGE_TAG = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.TARGET_COLOR}"
     }
 
     stages {
@@ -54,39 +56,26 @@ pipeline {
                         env.TARGET_DEPLOYMENT = env.GREEN_DEPLOYMENT
                         env.OTHER_DEPLOYMENT = env.BLUE_DEPLOYMENT
                     }
+                    
+                    // Update the image tag environment variable
+                    env.LOCAL_IMAGE_TAG = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.TARGET_COLOR}"
+                    
                     echo "Targeting deployment: ${env.TARGET_COLOR}"
+                    echo "Using image tag: ${env.LOCAL_IMAGE_TAG}"
                 }
             }
         }
 
-        // --- STAGE 2: Build and Push Docker Image (Direct to Minikube Docker Daemon) ---
-        stage('Build and Push Docker Image') {
+        // --- STAGE 2: Build Image (Direct to Minikube Docker Daemon) ---
+        stage('Build Image in Minikube') {
             steps {
                 script {
-                    def full_image_tag = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.IMAGE_TAG}"
-                    def color_image_tag = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.TARGET_COLOR}"
+                    // This command handles both building the image and ensuring it is available in Minikube's internal registry.
+                    echo "Building image in Minikube using tag: ${env.LOCAL_IMAGE_TAG}"
+                    sh "minikube image build -t ${env.LOCAL_IMAGE_TAG} ."
                     
-                    // 1. Build the image directly inside the Minikube Docker daemon
-                    // This command handles both build and ensuring the image is available in Minikube's internal registry.
-                    echo "Building image in Minikube: ${full_image_tag}"
-                    sh "minikube image build -t ${full_image_tag} ."
-                    
-                    // 2. Tag the image with the color
-                    // Note: We run the following Docker commands locally after setting the environment
-                    sh "eval \$(minikube docker-env)"
-                    sh "docker tag ${full_image_tag} ${color_image_tag}"
-                }
-                
-                // 3. Log in and push to Docker Hub (Required for public access/other environments, even if Minikube doesn't need it)
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-pass', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
-                    echo "Pushing images to Docker Hub..."
-                    
-                    // Fixes the shell redirection error by using sh/EOF block
-                    sh """
-                    docker login -u ${DOCKER_USERNAME} --password-stdin <<< ${DOCKER_PASSWORD}
-                    docker push ${DOCKER_HUB_USER}/${APP_NAME}:${IMAGE_TAG}
-                    docker push ${DOCKER_HUB_USER}/${APP_NAME}:${TARGET_COLOR}
-                    """
+                    // NOTE: Docker Hub push steps are removed for simplicity and to bypass Minikube execution issues.
+                    // The image is now ready for deployment in the Minikube cluster.
                 }
             }
         }
@@ -96,12 +85,15 @@ pipeline {
             steps {
                 script {
                     def kubectl_prefix = "minikube kubectl -- "
-                    def current_deployment_file = "deployment-${env.TARGET_COLOR}.yaml" // Use the appropriate YAML file
 
                     if (env.TARGET_COLOR == 'blue') {
                         echo "Initial deployment of BLUE."
-                        // Apply the blue deployment file
+                        // 1. Apply the service (needs to be done only once)
+                        sh "${kubectl_prefix} apply -f service.yaml"
+                        // 2. Apply the blue deployment file
                         sh "${kubectl_prefix} apply -f deployment-blue.yaml"
+                        // 3. Set the image using the freshly built local tag
+                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${env.LOCAL_IMAGE_TAG}"
                     } else {
                         // Deploy the green version by patching the blue deployment file
                         echo "Deploying ${env.TARGET_COLOR} deployment: ${env.TARGET_DEPLOYMENT}"
@@ -113,8 +105,8 @@ pipeline {
                         sed 's/color: blue/color: green/g' | \\
                         ${kubectl_prefix} apply -f -
                         """
-                        // Then set the image on the new deployment (this uses the color tag, which was just built/pushed)
-                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
+                        // Then set the image on the new deployment (this uses the color tag, which was just built)
+                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${env.LOCAL_IMAGE_TAG}"
                     }
                 }
             }
@@ -131,9 +123,8 @@ pipeline {
             steps {
                 script {
                     def kubectl_prefix = "minikube kubectl -- "
-
-                    // The service.yaml must be applied once to ensure the myapp-service exists
-                    sh "${kubectl_prefix} apply -f service.yaml"
+                    
+                    // The service.yaml is applied in the Deploy New Version stage now.
                     
                     // Only pause and switch if this is a deployment switch (i.e., not the very first run)
                     if (env.BUILD_NUMBER.toInteger() > 1 || env.TARGET_COLOR == 'green') {
