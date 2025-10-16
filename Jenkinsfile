@@ -23,16 +23,15 @@ pipeline {
         stage('Determine Target Color') {
             steps {
                 script {
-                    // This logic must run where kubectl is available. 
-                    // Since we can't easily install kubectl on the default agent, 
-                    // we will assume Blue is initial, and Green is subsequent.
+                    // Minikube ssh is used to execute kubectl inside the minikube VM where it is installed.
+                    def minikube_prefix = "minikube ssh -- "
                     
                     // Simple logic for Minikube/Kubernetes: Check if the blue deployment exists.
                     // If it exists and is running, we deploy green next. Otherwise, deploy blue.
                     
                     // Note: If this fails, we fall back to a safer default (blue on first run)
                     try {
-                        def status = sh(script: "kubectl get deployment ${BLUE_DEPLOYMENT} --ignore-not-found -o custom-columns=STATUS:.status.replicas", returnStatus: true)
+                        def status = sh(script: "${minikube_prefix} kubectl get deployment ${BLUE_DEPLOYMENT} --ignore-not-found -o custom-columns=STATUS:.status.replicas", returnStatus: true)
                         
                         if (status == 0) {
                             env.TARGET_COLOR = 'green'
@@ -65,9 +64,13 @@ pipeline {
         // --- STAGE 2: Build and Push Docker Image (Requires Docker/Kaniko) ---
         stage('Build & Push Docker Image') {
             steps {
-                // This fix uses the assumption that the main Jenkins Pod has access to Docker via D-i-D setup
+                // withCredentials now correctly expects StandardUsernamePasswordCredentials
                 withCredentials([usernamePassword(credentialsId: 'dockerhub-pass', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
-                    sh "docker login -u ${DOCKER_HUB_USER} --password-stdin <<< ${DOCKER_PASSWORD}"
+                    // Use Minikube's built-in Docker daemon for building (no 'minikube ssh' needed here, just set the env)
+                    sh "eval \$(minikube docker-env)"
+                    
+                    // Log in using the credentials pulled from Jenkins secret
+                    sh "docker login -u ${DOCKER_USERNAME} --password-stdin <<< ${DOCKER_PASSWORD}"
                     
                     // Build the image using the current BUILD_NUMBER as the tag
                     sh "docker build -t ${DOCKER_HUB_USER}/${APP_NAME}:${IMAGE_TAG} ."
@@ -84,23 +87,26 @@ pipeline {
         stage('Deploy New Version') {
             steps {
                 script {
+                    def minikube_prefix = "minikube ssh -- "
+                    
                     // Initial deployment uses the deployment-blue.yaml
                     if (env.TARGET_COLOR == 'blue') {
                         echo "Initial deployment of BLUE."
-                        sh "kubectl apply -f deployment-blue.yaml"
+                        sh "${minikube_prefix} kubectl apply -f deployment-blue.yaml"
                     } else {
                         // Deploy the green version by patching the blue deployment file
                         echo "Deploying ${env.TARGET_COLOR} deployment: ${env.TARGET_DEPLOYMENT}"
                         
                         // Use sed to replace BLUE attributes with GREEN attributes for deployment creation
+                        // NOTE: kubectl apply -f is run locally, but the final apply is piped to kubectl inside the VM
                         sh """
-                        kubectl apply -f deployment-blue.yaml -o yaml --dry-run=client | \
-                        sed 's/${BLUE_DEPLOYMENT}/${GREEN_DEPLOYMENT}/g' | \
-                        sed 's/color: blue/color: green/g' | \
-                        kubectl apply -f -
+                        kubectl apply -f deployment-blue.yaml -o yaml --dry-run=client | \\
+                        sed 's/${BLUE_DEPLOYMENT}/${GREEN_DEPLOYMENT}/g' | \\
+                        sed 's/color: blue/color: green/g' | \\
+                        ${minikube_prefix} kubectl apply -f -
                         """
                         // Then set the image on the new deployment to the newly pushed GREEN image
-                        sh "kubectl set image deployment/${env.TARGET_DEPLOYMENT} myapp=${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
+                        sh "${minikube_prefix} kubectl set image deployment/${env.TARGET_DEPLOYMENT} myapp=${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
                     }
                 }
             }
@@ -108,7 +114,7 @@ pipeline {
         
         stage('Wait for New Deployment Readiness') {
             steps {
-                sh "kubectl rollout status deployment/${env.TARGET_DEPLOYMENT}"
+                sh "minikube ssh -- kubectl rollout status deployment/${env.TARGET_DEPLOYMENT}"
             }
         }
 
@@ -116,8 +122,10 @@ pipeline {
         stage('Switch Service (Blue-Green Swap)') {
             steps {
                 script {
+                    def minikube_prefix = "minikube ssh -- "
+
                     // The service.yaml must be applied once to ensure the myapp-service exists
-                    sh "kubectl apply -f service.yaml"
+                    sh "${minikube_prefix} kubectl apply -f service.yaml"
                     
                     // Only pause and switch if this is a deployment switch (i.e., not the very first run)
                     if (env.BUILD_NUMBER.toInteger() > 1 || env.TARGET_COLOR == 'green') {
@@ -128,12 +136,12 @@ pipeline {
                         
                         // Patch the Service to point to the new color
                         echo "Patching service selector from ${env.OTHER_DEPLOYMENT} to ${env.TARGET_DEPLOYMENT} (${env.TARGET_COLOR})"
-                        sh "kubectl patch service myapp-service -p '{\"spec\":{\"selector\":{\"color\":\"${env.TARGET_COLOR}\"}}}'"
+                        sh "${minikube_prefix} kubectl patch service myapp-service -p '{\"spec\":{\"selector\":{\"color\":\"${env.TARGET_COLOR}\"}}}'"
                         echo "Service successfully switched to ${env.TARGET_COLOR}!"
                         
                         // Clean up the old deployment
                         echo "Cleaning up old deployment: ${env.OTHER_DEPLOYMENT}"
-                        sh "kubectl delete deployment ${env.OTHER_DEPLOYMENT} --ignore-not-found"
+                        sh "${minikube_prefix} kubectl delete deployment ${env.OTHER_DEPLOYMENT} --ignore-not-found"
                     } else {
                          echo "Initial deployment of BLUE completed. No switch required yet."
                     }
