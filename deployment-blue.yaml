@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-blue
+  labels:
+    app: myapp
+    color: blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: myapp
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: myapp
+        color: blue
+    spec:
+      containers:
+      - name: myapp
+        image: parvathyv-nair/myapp:placeholder # <<< Ensure 'parvathyv-nair' is your Docker Hub username
+        ports:
+        - containerPort: 80
