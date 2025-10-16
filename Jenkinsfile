@@ -1,6 +1,6 @@
 pipeline {
-    // The main node will run the cleanup/setup commands, but the core stages use dedicated agents.
-    agent any // Changed from 'master' to 'any' to run on the default executor
+    // We use 'agent any' to run on the built-in executor, which has the 'minikube' CLI available.
+    agent any
 
     environment {
         // Replace with your Docker Hub username
@@ -23,17 +23,15 @@ pipeline {
         stage('Determine Target Color') {
             steps {
                 script {
-                    // Minikube ssh is used to execute kubectl inside the minikube VM where it is installed.
-                    def minikube_prefix = "minikube ssh -- "
+                    // Check if the blue deployment exists and has replicas. If so, deploy green next.
+                    // We run kubectl commands directly using 'minikube kubectl --' to ensure it runs inside the Minikube environment.
+                    def kubectl_prefix = "minikube kubectl -- "
                     
-                    // Simple logic for Minikube/Kubernetes: Check if the blue deployment exists.
-                    // If it exists and is running, we deploy green next. Otherwise, deploy blue.
-                    
-                    // Note: If this fails, we fall back to a safer default (blue on first run)
                     try {
-                        def status = sh(script: "${minikube_prefix} kubectl get deployment ${BLUE_DEPLOYMENT} --ignore-not-found -o custom-columns=STATUS:.status.replicas", returnStatus: true)
+                        // Check status.replicas of the blue deployment (only works if kubectl is available)
+                        def status = sh(script: "${kubectl_prefix} get deployment ${BLUE_DEPLOYMENT} --ignore-not-found -o jsonpath='{.status.replicas}'", returnStdout: true).trim()
                         
-                        if (status == 0) {
+                        if (status.toInteger() > 0) {
                             env.TARGET_COLOR = 'green'
                         } else {
                             env.TARGET_COLOR = 'blue'
@@ -43,7 +41,7 @@ pipeline {
                         if (env.BUILD_NUMBER.toInteger() == 1) {
                             env.TARGET_COLOR = 'blue'
                         } else {
-                            // If build > 1 but kubectl check failed, assume green for rollback/next deploy
+                            // If build > 1 but kubectl check failed, assume green
                             env.TARGET_COLOR = 'green'
                         }
                     }
@@ -61,24 +59,34 @@ pipeline {
             }
         }
 
-        // --- STAGE 2: Build and Push Docker Image (Requires Docker/Kaniko) ---
-        stage('Build & Push Docker Image') {
+        // --- STAGE 2: Build and Push Docker Image (Direct to Minikube Docker Daemon) ---
+        stage('Build and Push Docker Image') {
             steps {
-                // withCredentials now correctly expects StandardUsernamePasswordCredentials
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-pass', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
-                    // Use Minikube's built-in Docker daemon for building (no 'minikube ssh' needed here, just set the env)
+                script {
+                    def full_image_tag = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.IMAGE_TAG}"
+                    def color_image_tag = "${env.DOCKER_HUB_USER}/${env.APP_NAME}:${env.TARGET_COLOR}"
+                    
+                    // 1. Build the image directly inside the Minikube Docker daemon
+                    // This command handles both build and ensuring the image is available in Minikube's internal registry.
+                    echo "Building image in Minikube: ${full_image_tag}"
+                    sh "minikube image build -t ${full_image_tag} ."
+                    
+                    // 2. Tag the image with the color
+                    // Note: We run the following Docker commands locally after setting the environment
                     sh "eval \$(minikube docker-env)"
+                    sh "docker tag ${full_image_tag} ${color_image_tag}"
+                }
+                
+                // 3. Log in and push to Docker Hub (Required for public access/other environments, even if Minikube doesn't need it)
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-pass', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                    echo "Pushing images to Docker Hub..."
                     
-                    // Log in using the credentials pulled from Jenkins secret
-                    sh "docker login -u ${DOCKER_USERNAME} --password-stdin <<< ${DOCKER_PASSWORD}"
-                    
-                    // Build the image using the current BUILD_NUMBER as the tag
-                    sh "docker build -t ${DOCKER_HUB_USER}/${APP_NAME}:${IMAGE_TAG} ."
-                    sh "docker tag ${DOCKER_HUB_USER}/${APP_NAME}:${IMAGE_TAG} ${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
-                    
-                    // Push both the numbered tag and the color tag
-                    sh "docker push ${DOCKER_HUB_USER}/${APP_NAME}:${IMAGE_TAG}"
-                    sh "docker push ${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
+                    // Fixes the shell redirection error by using sh/EOF block
+                    sh """
+                    docker login -u ${DOCKER_USERNAME} --password-stdin <<< ${DOCKER_PASSWORD}
+                    docker push ${DOCKER_HUB_USER}/${APP_NAME}:${IMAGE_TAG}
+                    docker push ${DOCKER_HUB_USER}/${APP_NAME}:${TARGET_COLOR}
+                    """
                 }
             }
         }
@@ -87,26 +95,26 @@ pipeline {
         stage('Deploy New Version') {
             steps {
                 script {
-                    def minikube_prefix = "minikube ssh -- "
-                    
-                    // Initial deployment uses the deployment-blue.yaml
+                    def kubectl_prefix = "minikube kubectl -- "
+                    def current_deployment_file = "deployment-${env.TARGET_COLOR}.yaml" // Use the appropriate YAML file
+
                     if (env.TARGET_COLOR == 'blue') {
                         echo "Initial deployment of BLUE."
-                        sh "${minikube_prefix} kubectl apply -f deployment-blue.yaml"
+                        // Apply the blue deployment file
+                        sh "${kubectl_prefix} apply -f deployment-blue.yaml"
                     } else {
                         // Deploy the green version by patching the blue deployment file
                         echo "Deploying ${env.TARGET_COLOR} deployment: ${env.TARGET_DEPLOYMENT}"
                         
-                        // Use sed to replace BLUE attributes with GREEN attributes for deployment creation
-                        // NOTE: kubectl apply -f is run locally, but the final apply is piped to kubectl inside the VM
+                        // Use sed to create the green deployment YAML from the blue one on the fly and apply it
                         sh """
                         kubectl apply -f deployment-blue.yaml -o yaml --dry-run=client | \\
                         sed 's/${BLUE_DEPLOYMENT}/${GREEN_DEPLOYMENT}/g' | \\
                         sed 's/color: blue/color: green/g' | \\
-                        ${minikube_prefix} kubectl apply -f -
+                        ${kubectl_prefix} apply -f -
                         """
-                        // Then set the image on the new deployment to the newly pushed GREEN image
-                        sh "${minikube_prefix} kubectl set image deployment/${env.TARGET_DEPLOYMENT} myapp=${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
+                        // Then set the image on the new deployment (this uses the color tag, which was just built/pushed)
+                        sh "${kubectl_prefix} set image deployment/${env.TARGET_DEPLOYMENT} myapp=${DOCKER_HUB_USER}/${APP_NAME}:${env.TARGET_COLOR}"
                     }
                 }
             }
@@ -114,7 +122,7 @@ pipeline {
         
         stage('Wait for New Deployment Readiness') {
             steps {
-                sh "minikube ssh -- kubectl rollout status deployment/${env.TARGET_DEPLOYMENT}"
+                sh "minikube kubectl -- rollout status deployment/${env.TARGET_DEPLOYMENT}"
             }
         }
 
@@ -122,10 +130,10 @@ pipeline {
         stage('Switch Service (Blue-Green Swap)') {
             steps {
                 script {
-                    def minikube_prefix = "minikube ssh -- "
+                    def kubectl_prefix = "minikube kubectl -- "
 
                     // The service.yaml must be applied once to ensure the myapp-service exists
-                    sh "${minikube_prefix} kubectl apply -f service.yaml"
+                    sh "${kubectl_prefix} apply -f service.yaml"
                     
                     // Only pause and switch if this is a deployment switch (i.e., not the very first run)
                     if (env.BUILD_NUMBER.toInteger() > 1 || env.TARGET_COLOR == 'green') {
@@ -136,12 +144,12 @@ pipeline {
                         
                         // Patch the Service to point to the new color
                         echo "Patching service selector from ${env.OTHER_DEPLOYMENT} to ${env.TARGET_DEPLOYMENT} (${env.TARGET_COLOR})"
-                        sh "${minikube_prefix} kubectl patch service myapp-service -p '{\"spec\":{\"selector\":{\"color\":\"${env.TARGET_COLOR}\"}}}'"
+                        sh "${kubectl_prefix} patch service myapp-service -p '{\"spec\":{\"selector\":{\"color\":\"${env.TARGET_COLOR}\"}}}'"
                         echo "Service successfully switched to ${env.TARGET_COLOR}!"
                         
                         // Clean up the old deployment
                         echo "Cleaning up old deployment: ${env.OTHER_DEPLOYMENT}"
-                        sh "${minikube_prefix} kubectl delete deployment ${env.OTHER_DEPLOYMENT} --ignore-not-found"
+                        sh "${kubectl_prefix} delete deployment ${env.OTHER_DEPLOYMENT} --ignore-not-found"
                     } else {
                          echo "Initial deployment of BLUE completed. No switch required yet."
                     }
